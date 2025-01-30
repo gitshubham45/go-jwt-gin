@@ -17,6 +17,10 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Logger())
 
+	router.GET("/api/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "ok"})
+	})
+
 	routes.AuthRoutes(router)
 	routes.UserRoutes(router)
 

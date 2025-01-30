@@ -8,6 +8,7 @@ import (
 	"goJwt/models"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,16 +22,23 @@ import (
 var userCollection *mongo.Collection = database.OpenCollection(database.Client, "user")
 var validate = validator.New()
 
-func HashPassword()
+func HashPassword(password string) string {
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), 14)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	return string(hashedPassword)
+}
 
 func VerifyPassword(userPassword string, providedPassword string) (bool, string) {
-	err := bcrypt.CompareHashAndPassword([]byte(providedPassword),[]byte(userPassword))
+	err := bcrypt.CompareHashAndPassword([]byte(providedPassword), []byte(userPassword))
 	check := true
 	msg := ""
 
 	if err != nil {
 		msg = fmt.Sprintf("email or passwor is incorrect")
-		check = false;
+		check = false
 	}
 	return check, msg
 }
@@ -51,6 +59,9 @@ func Signup() gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
 			return
 		}
+
+		password := HashPassword(*user.Password)
+		user.Password = &password
 
 		count1, err := userCollection.CountDocuments(ctx, bson.M{"email": user.Email})
 		defer cancel()
@@ -95,6 +106,7 @@ func Signup() gin.HandlerFunc {
 func Login() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+		defer cancel()
 		var user models.User
 		var foundUser models.User
 
@@ -113,10 +125,30 @@ func Login() gin.HandlerFunc {
 		passwordIsValid, msg := VerifyPassword(*user.Password, *foundUser.Password)
 		defer cancel()
 
+		if !passwordIsValid {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+			return
+		}
+
+		if foundUser.Email == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "user not found"})
+			return
+		}
+
+		token, refreshToken, _ := helper.GenerateAllTokens(*foundUser.Email, *foundUser.First_name, *foundUser.Last_name, *foundUser.User_type, foundUser.User_id)
+		helper.UpdateAllTokens(token, refreshToken, foundUser.User_id)
+
+		err = userCollection.FindOne(ctx, bson.M{"user_id": foundUser.User_id}).Decode(&foundUser)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err})
+			return
+		}
+		c.JSON(http.StatusOK, foundUser)
 	}
 }
 
-func GetUsers() gin.HandlerFunc {
+func GetUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userId := c.Param("user_id")
 
@@ -137,4 +169,61 @@ func GetUsers() gin.HandlerFunc {
 	}
 }
 
-func GetUser()
+func GetUsers() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := helper.CheckUserType(c, "ADMIN"); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()}) // 401 Unauthorized is better
+			c.Abort()
+			return
+		}
+
+		var ctx, cancel = context.WithTimeout(context.Background(), 100*time.Second)
+		defer cancel() // Defer cancel immediately
+
+		recordPerPage, err := strconv.Atoi(c.Query("recordPerPage"))
+		if err != nil || recordPerPage < 1 {
+			recordPerPage = 10
+		}
+
+		page, err := strconv.Atoi(c.Query("page"))
+		if err != nil || page < 1 {
+			page = 1
+		}
+
+		startIndex := (page - 1) * recordPerPage
+
+		matchStage := bson.D{{Key: "$match", Value: bson.D{{}}}}
+		groupStage := bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "_id", Value: "null"}}},
+			{Key: "total_count", Value: bson.D{{Key: "$sum", Value: 1}}},
+			{Key: "data", Value: bson.D{{Key: "$push", Value: "$$ROOT"}}}}}}
+		projectStage := bson.D{
+			{Key: "$project", Value: bson.D{
+				{Key: "_id", Value: 0},
+				{Key: "total_count", Value: 1},
+				{Key: "user_items", Value: bson.D{{Key: "$slice", Value: []interface{}{"$data", startIndex, recordPerPage}}}}}}}
+
+		// Aggregation pipeline without groupStage
+		pipeline := mongo.Pipeline{matchStage, groupStage, projectStage}
+
+		cursor, err := userCollection.Aggregate(ctx, pipeline)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error aggregating users data: " + err.Error()}) // Include error message
+			return
+		}
+		defer cursor.Close(ctx) // Close the cursor
+
+		var allUsers []bson.M
+		if err := cursor.All(ctx, &allUsers); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error fetching users: " + err.Error()}) // Correct error handling
+			return
+		}
+
+		if len(allUsers) == 0 { // Check for empty result
+			c.JSON(http.StatusOK, gin.H{"total_count": 0, "user_items": []interface{}{}}) // Return empty array if no users
+			return
+		}
+
+		c.JSON(http.StatusOK, allUsers[0]) // Now safe to access allUsers[0]
+	}
+}
